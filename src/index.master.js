@@ -3,11 +3,11 @@
 const cluster = require('cluster');
 const assert = require('assert');
 const nonce = require('nonce')();
+const DoubleIndexedContainer = require('./double-indexed-container');
 
 assert(cluster.isMaster);
 
-const messageCallbacks = {};
-const messageTimeouts = {};
+const resolvers = new DoubleIndexedContainer();
 
 function init(worker) {
     worker.on('message', message => {
@@ -15,44 +15,51 @@ function init(worker) {
             return;
         }
 
-        const id = message.__clusterTalkId;
-
-        const callback = messageCallbacks[id];
+        const resolver = resolvers.get(message.__clusterTalkId);
         
-        if (typeof callback === 'undefined') {
+        if (resolver == null) {
             return;
         }
 
-        clearTimeout(messageTimeouts[id]);
+        resolver.resolve(message.data);
+    });
 
-        delete messageTimeouts[id];
-        delete messageCallbacks[id];
+    worker.on('exit', function (){
+        resolvers.getAll(worker.id).forEach(resolver => {
+            resolver.reject(`Worker ${worker.id} exited prematurely.`);
+        });
 
-        callback(message.data);
+        resolvers.removeAll(worker.id);
     });
 };
 
-function send(worker, subject, data, timeout, callback) {
-    if (typeof callback !== 'function') {
-        throw new ClusterTalkException(`"Callback must be defined as a function.`);
-    }
-
+function send(worker, subject, data, timeoutInMilliseconds) {
     const id = nonce();
 
-    const message = {
-        __clusterTalkId: id,
-        subject,
-        data
-    };
+    return new Promise((resolve, reject) => {
+        const message = {
+            __clusterTalkId: id,
+            subject,
+            data
+        };
 
-    messageCallbacks[id] = callback;
-    
-    messageTimeouts[id] = setTimeout(function () {
-        delete messageTimeouts[id];
-        delete messageCallbacks[id];
-    }, timeout);
+        resolvers.add(id, worker.id, {
+            resolve,
+            reject
+        });
 
-    worker.send(message);
+        setTimeout(() => {
+            reject("Timeout while waiting for response to message id: " + id);
+        }, timeoutInMilliseconds)
+
+        worker.send(message);
+    }).then(data => {
+        resolvers.remove(id);
+        return data;
+    }).catch(error => {
+        resolvers.remove(id);
+        throw error;
+    });
 };
 
 function isClusterTalkMessage(message) {
